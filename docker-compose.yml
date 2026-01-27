@@ -1,0 +1,20 @@
+services:
+  app:
+    build: .
+    container_name: openapi-history-tracker
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./projects.yaml:/app/projects.yaml
+      - ./cache_data:/app/cache_data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=INFO
+      - TZ=Europe/Moscow

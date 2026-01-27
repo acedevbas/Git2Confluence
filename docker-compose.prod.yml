@@ -1,0 +1,22 @@
+services:
+  app:
+    # Замените 'your-user/openapi-history' на имя вашего репозитория (Docker Hub / GitLab Registry)
+    image: acedevbas/openapi-history:latest
+    container_name: openapi-history-tracker
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      # Монтируем конфигурации с хоста
+      - ./projects.yaml:/app/projects.yaml
+      - ./.env:/app/.env
+      # Монтируем данные (кеш и логи) для персистентности
+      - ./cache_data:/app/cache_data
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - TZ=Europe/Moscow

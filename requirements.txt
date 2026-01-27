@@ -1,0 +1,24 @@
+python-gitlab
+prance
+openapi-spec-validator
+deepdiff
+ruamel.yaml
+requests
+pydantic-settings>=2.0.0
+orjson>=3.9.0
+atlassian-python-api>=3.41.0
+
+# API Server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-dotenv>=1.0.0
+apscheduler>=3.10.0
+
+# Async HTTP client for optimized GitLab operations
+aiohttp>=3.9.0
+
+# CLI for batch operations
+click>=8.0.0
+
+# YAML configuration parsing
+pyyaml>=6.0.0

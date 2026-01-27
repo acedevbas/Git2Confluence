@@ -1,0 +1,40 @@
+defaults:
+  gitlab_url: ${GITLAB_URL}
+  gitlab_ssl_verify: false
+  target_branch: master
+  swagger:
+    path: api/swagger
+    entry_files:
+    - openapi.yaml
+    - openapi.json
+    - api.yaml
+    - api.json
+projects:
+- name: RMS API
+  path: logistic/retail/rms/rms-api
+  gitlab_token: "YOUR_TOKEN_HERE"
+  target_branch: master
+  confluence:
+    space: pickup
+    parent_page_id: '169804502'
+    token: "YOUR_TOKEN_HERE"
+  swagger:
+    path: api/swagger
+    entry_files:
+    - openapi.yaml
+    - openapi.json
+    - api.yaml
+    - api.json
+- name: storefront-api
+  path: logistic/retail/storefront-api
+  gitlab_token: "YOUR_TOKEN_HERE"
+  target_branch: master
+  confluence:
+    space: pickup
+    parent_page_id: '301467109'
+    token: "YOUR_TOKEN_HERE"
+  swagger:
+    path: api/swagger
+    entry_files:
+    - openapi.yaml
+    - swagger.json
