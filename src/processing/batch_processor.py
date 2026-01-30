@@ -802,6 +802,13 @@ class BatchProcessor:
                                     final_mr.get('source_branch', '')
                                 )
                                 
+                                # Fallback to Parent MR if Origin didn't have a task ID
+                                if final_task_id == 'NO-TASK' and origin_mr:
+                                    final_task_id = self._extract_task_id(
+                                        mr.get('title', ''), 
+                                        mr.get('source_branch', '')
+                                    )
+                                
                                 # REVERT detection: pure state-based logic
                                 # If endpoint was DELETED and now CREATED again = REVERT
                                 if (event_type == "CREATED" and 
@@ -1087,6 +1094,13 @@ class BatchProcessor:
                             final_mr.get('title', ''), 
                             final_mr.get('source_branch', '')
                         )
+
+                        # Fallback to Parent MR if Origin didn't have a task ID
+                        if final_task_id == 'NO-TASK' and origin_mr:
+                            final_task_id = self._extract_task_id(
+                                mr.get('title', ''), 
+                                mr.get('source_branch', '')
+                            )
                         
                         # Check for Revert and set event_type accordingly
                         if final_mr.get('title', '').lower().startswith('revert') or final_mr.get('source_branch', '').lower().startswith('revert'):
