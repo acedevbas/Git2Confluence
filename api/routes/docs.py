@@ -67,11 +67,22 @@ async def generate_documentation(
         from src.cache.disk_cache import DiskCacheManager
         from src.cache.endpoint_history_cache import EndpointHistoryCache
         
+        # Resolve project name for cache lookup (name is the cache key)
+        from .projects import _load_config as _load_projects_config
+        project_name = request.project_name or ""
+        if not project_name:
+            for p in _load_projects_config().get("projects", []):
+                if p.get("path") == request.project_path:
+                    project_name = p.get("name", "")
+                    break
+        if not project_name:
+            project_name = request.project_path.split('/')[-1]
+
         cache = DiskCacheManager()
         history_cache = EndpointHistoryCache(cache)
-        
-        history = history_cache.get_history(request.project_path, endpoint_key)
-        
+
+        history = history_cache.get_history(project_name, endpoint_key)
+
         if history and history.events:
             logger.info(f"[GENERATE] Using pre-computed history: {len(history.events)} events")
             
@@ -120,7 +131,8 @@ async def generate_documentation(
             method=method,
             path=path,
             events=history_events,
-            project_path=request.project_path
+            project_path=request.project_path,
+            project_name=project_name
         )
         
         processing_time = time.time() - start_time

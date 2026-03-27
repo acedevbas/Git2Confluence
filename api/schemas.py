@@ -36,7 +36,12 @@ class DocumentationRequest(BaseModel):
         description="GitLab project path (e.g., 'logistic/retail/rms/rms-api')",
         example="logistic/retail/rms/rms-api"
     )
-    
+    project_name: Optional[str] = Field(
+        default=None,
+        description="Project name from config (used for page title prefix when multiple projects share the same path)",
+        example="tms-api-v2"
+    )
+
     model_config = {
         "json_schema_extra": {
             "examples": [
@@ -115,6 +120,11 @@ class CacheWarmRequest(BaseModel):
         ...,
         description="GitLab project path (e.g., 'logistic/retail/rms/rms-api')",
         example="logistic/retail/rms/rms-api"
+    )
+    project_name: Optional[str] = Field(
+        default=None,
+        description="Project name from config (required when multiple projects share the same path)",
+        example="tms-api-orders"
     )
     mr_limit: Optional[int] = Field(
         default=None,

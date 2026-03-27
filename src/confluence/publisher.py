@@ -150,17 +150,19 @@ class ConfluencePublisher:
         path: str,
         events: List[Dict[str, Any]],
         project_path: str = "",
+        project_name: str = "",
         summary: str = "",
         description: str = ""
     ) -> Dict[str, Any]:
         """
         Publish endpoint change history to Confluence with full documentation.
-        
+
         Args:
             method: HTTP method (GET, POST, etc.)
             path: Endpoint path (/orders/products/return, etc.)
             events: List of change events from TurboHistoryBuilder
             project_path: GitLab project path for title prefix extraction
+            project_name: Project display name from config (used for title prefix)
             summary: Endpoint summary (from OpenAPI)
             description: Endpoint description
         
@@ -180,15 +182,14 @@ class ConfluencePublisher:
                 if not description:
                     description = latest_schema.get('description', 'Документация API метода с историей изменений')
         
-        # Generate title prefix from project_path
-        # e.g. "retail/storefront-api" → "[STOREFRONT-API] ..."
-        # e.g. "logistic/retail/rms/rms-api" → "[RMS-API] ..."
-        if project_path:
-            project_name = project_path.rstrip('/').split('/')[-1]
-            # Use project name as-is in uppercase with brackets
-            title_prefix = f"[{project_name.upper()}]"
+        # Generate title prefix from project_name (from config) or fallback to project_path
+        if project_name:
+            display_name = project_name
+        elif project_path:
+            display_name = project_path.rstrip('/').split('/')[-1]
         else:
-            title_prefix = "[API]"
+            display_name = "API"
+        title_prefix = f"[{display_name.upper()}]"
         
         # Generate page title using summary (not path)
         title_text = summary if summary else path.replace("/", " ").strip()
@@ -200,7 +201,7 @@ class ConfluencePublisher:
         # Generate Confluence Storage Format content and get events with metadata
         content, events_with_metadata = self._generate_full_page_content(
             method, path, events, summary, description, environments_page_info, page_title=title,
-            service_name=project_name.upper() if project_path else "API"
+            service_name=display_name.upper()
         )
         
         # Find existing page or create new one
@@ -292,7 +293,7 @@ class ConfluencePublisher:
                 content, events_with_metadata = self._generate_full_page_content(
                     method, path, events, summary, description, environments_page_info, 
                     page_title=title, preserved_descriptions=preserved_descriptions,
-                    service_name=project_name.upper() if project_path else "API"
+                    service_name=display_name.upper()
                 )
 
 

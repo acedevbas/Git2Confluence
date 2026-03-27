@@ -168,12 +168,12 @@ def generate_task_tab_content(
     # FormData section
     formdata_section = ""
     if formdata_table:
-        formdata_section = f"<h5>Параметры FormData</h5>\n{formdata_table}"
+        formdata_section = f"<p><strong>Параметры FormData</strong></p>\n{formdata_table}"
     
     # Request body section
     request_body_section = ""
     if request_desc_multiexcerpt:
-        request_body_section = f"<h5>Тело запроса</h5>\n{request_desc_multiexcerpt}"
+        request_body_section = f"<p><strong>Тело запроса</strong></p>\n{request_desc_multiexcerpt}"
     
     # Error sections
     error_sections = []
@@ -218,7 +218,7 @@ def generate_task_tab_content(
 <tr class="">
 <td><div class="content-wrapper">{request_body_multiexcerpt}</div></td>
 <td>
-<h5>Параметры</h5>
+<p><strong>Параметры</strong></p>
 {header_multiexcerpt}
 {formdata_section}
 {request_body_section}

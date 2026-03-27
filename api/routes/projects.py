@@ -116,12 +116,12 @@ async def add_project(project: ProjectConfig):
     """Добавить новый проект в конфигурацию."""
     data = _load_config()
     
-    # Check duplicate
+    # Check duplicate by name (name is the unique identifier)
     for p in data.get("projects", []):
-        if p.get("path") == project.path:
+        if p.get("name") == project.name:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Project with path '{project.path}' already exists"
+                detail=f"Project with name '{project.name}' already exists"
             )
     
     # Convert to dict for YAML
@@ -137,71 +137,63 @@ async def add_project(project: ProjectConfig):
 
 
 @router.put(
-    "/{path_id:path}",
+    "/{project_name}",
     response_model=ProjectConfig,
     summary="Обновить проект"
 )
 async def update_project(
-    path_id: str,
+    project_name: str,
     project: ProjectConfig
 ):
-    """
-    Обновить конфигурацию проекта. 
-    path_id should be double URL encoded if it contains slashes, or just plain if FastAPI handles it.
-    FastAPI handles path parameters with slashes if declared as {path:path}.
-    """
-    # Unescape logic might be needed if user sends encoded slash, but generally 
-    # {path:path} captures "group/project" fine.
-    
+    """Обновить конфигурацию проекта по имени."""
     data = _load_config()
-    
+
     found_idx = -1
     for i, p in enumerate(data.get("projects", [])):
-        if p.get("path") == path_id:
+        if p.get("name") == project_name:
             found_idx = i
             break
-            
+
     if found_idx == -1:
-        # Try finding by looking at the body's path if path_id matches nothing?
-        # Strict matching on path_id is safer.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project '{path_id}' not found"
+            detail=f"Project '{project_name}' not found"
         )
-    
-    # If project path changes, we need to ensure new path doesn't conflict
-    if project.path != path_id:
+
+    # If name changes, ensure new name doesn't conflict
+    if project.name != project_name:
         for p in data.get("projects", []):
-            if p.get("path") == project.path:
-                 raise HTTPException(
+            if p.get("name") == project.name:
+                raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Cannot rename to '{project.path}': project already exists"
+                    detail=f"Cannot rename to '{project.name}': project with this name already exists"
                 )
-    
-    # Update
+
     new_data = project.model_dump(exclude_none=True, mode='json')
     data["projects"][found_idx] = new_data
     _save_config(data)
-    
+
     return project
 
 @router.delete(
-    "/{path_id:path}",
+    "/{project_name}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Удалить проект"
 )
-async def delete_project(path_id: str):
-    """Удалить проект из конфигурации."""
+async def delete_project(project_name: str):
+    """Удалить проект из конфигурации по имени."""
     data = _load_config()
-    
+
     initial_len = len(data.get("projects", []))
-    data["projects"] = [p for p in data.get("projects", []) if p.get("path") != path_id]
-    
+    data["projects"] = [
+        p for p in data.get("projects", []) if p.get("name") != project_name
+    ]
+
     if len(data["projects"]) == initial_len:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project '{path_id}' not found"
+            detail=f"Project '{project_name}' not found"
         )
-        
+
     _save_config(data)
     return None

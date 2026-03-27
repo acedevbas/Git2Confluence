@@ -239,16 +239,23 @@ class BatchProcessor:
             cache: Cache manager (creates default if None)
             max_concurrent_projects: Max projects to process in parallel
         """
-        self.projects = {p.path: p for p in projects}
+        self.projects = {p.name: p for p in projects}
+        self._projects_by_path: Dict[str, ProjectConfig] = {}
+        for p in projects:
+            if p.path not in self._projects_by_path:
+                self._projects_by_path[p.path] = p
         self.cache = cache or DiskCacheManager()
         self.spec_loader = SpecLoader()
         self.max_concurrent_projects = max_concurrent_projects
-        
-        # Initialize Origin Resolver with default config
+
         # Initialize Origin Resolver with default config
         self.origin_resolver = OriginMRResolver.create_default(
             self._download_spec_adapter
         )
+
+    def _get_config(self, project_id: str) -> Optional[ProjectConfig]:
+        """Look up project config by name (primary) or path (fallback)."""
+        return self.projects.get(project_id) or self._projects_by_path.get(project_id)
     
     @classmethod
     def from_config(cls, config_path: str = "projects.yaml") -> BatchProcessor:
@@ -307,13 +314,13 @@ class BatchProcessor:
             async with semaphore:
                 if with_history:
                     return await self.warm_cache_with_history(
-                        config.path,
+                        config.name,
                         incremental=incremental,
                         mr_limit=mr_limit,
                     )
                 else:
                     return await self.warm_cache_project(
-                        config.path,
+                        config.name,
                         incremental=incremental,
                         mr_limit=mr_limit,
                     )
@@ -342,85 +349,86 @@ class BatchProcessor:
     
     async def warm_cache_project(
         self,
-        project_path: str,
+        project_id: str,
         incremental: bool = True,
         mr_limit: Optional[int] = None,
     ) -> ProcessingResult:
         """
         Warm cache for a single project.
-        
+
         Args:
-            project_path: GitLab project path
+            project_id: Project name (primary) or GitLab path (fallback)
             incremental: Only fetch MRs since last run
             mr_limit: Maximum MRs to process (None for unlimited)
         """
-        config = self.projects.get(project_path)
+        config = self._get_config(project_id)
         if not config:
             return ProcessingResult(
                 project_name="Unknown",
-                project_path=project_path,
-                errors=[f"Project not found in config: {project_path}"],
+                project_path=project_id,
+                errors=[f"Project not found in config: {project_id}"],
             )
-        
+
+        cache_id = config.name  # unique key for cache namespacing
         start_time = datetime.now()
         result = ProcessingResult(
             project_name=config.name,
-            project_path=project_path,
+            project_path=config.path,
         )
         
         # Get last processed date for incremental warming
         since_date = None
         if incremental:
-            since_date = self._get_last_mr_date(project_path)
+            since_date = self._get_last_mr_date(cache_id)
             if since_date:
                 logger.info(f"[{config.name}] Incremental mode: since {since_date}")
-        
+
         try:
             client_config = ClientConfig(
                 base_url=config.gitlab_url,
                 token=config.gitlab_token,
                 ssl_verify=config.gitlab_ssl_verify,
             )
-            
+
             async with AsyncGitLabClient(client_config) as client:
                 # Fetch MRs
                 mrs = await client.get_merged_mrs(
-                    project_path,
+                    config.path,
                     limit=mr_limit,
                     since_date=since_date,
                     target_branch=config.target_branch,
                 )
                 result.mrs_found = len(mrs)
-                
+
                 if not mrs:
                     logger.info(f"[{config.name}] No new MRs to process")
                     return result
-                
+
                 logger.info(f"[{config.name}] Processing {len(mrs)} MRs")
-                
+
                 # Process each MR
                 for i, mr in enumerate(mrs, 1):
                     # Use original MR SHA (not merge_commit_sha) for accurate attribution
                     # when multiple MRs are merged through release branches
                     sha = mr.get('sha')  # last commit in MR branch before merge
                     mr_iid = mr.get('iid', '?')
-                    
+
                     if not sha:
                         continue
-                    
+
                     # Check cache
-                    if self.cache.has_spec(project_path, sha):
+                    if self.cache.has_spec(cache_id, sha):
                         result.specs_skipped += 1
                         continue
-                    
+
                     # Process MR
                     try:
                         spec, method = await self._process_single_mr(
                             client, config, sha
                         )
-                        
+
                         if spec:
-                            self.cache.set_spec(project_path, sha, spec)
+                            self.cache.set_spec(cache_id, sha, spec)
                             result.specs_cached += 1
                             if method == "folder":
                                 result.method_folder += 1
@@ -428,18 +436,18 @@ class BatchProcessor:
                                 result.method_archive += 1
                         else:
                             result.specs_failed += 1
-                            
+
                     except Exception as e:
                         result.specs_failed += 1
                         result.errors.append(f"MR !{mr_iid}: {e}")
-                    
+
                     # Progress logging every 10 MRs
                     if i % 10 == 0:
                         logger.info(
                             f"[{config.name}] Progress: {i}/{len(mrs)} "
                             f"(cached: {result.specs_cached}, skipped: {result.specs_skipped})"
                         )
-                
+
                 # Update last MR date
                 if mrs:
                     latest_date = max(
@@ -447,7 +455,7 @@ class BatchProcessor:
                         for mr in mrs
                         if mr.get('merged_at')
                     )
-                    self._set_last_mr_date(project_path, latest_date)
+                    self._set_last_mr_date(cache_id, latest_date)
         
         except Exception as e:
             result.errors.append(f"Project error: {e}")
@@ -547,48 +555,49 @@ class BatchProcessor:
     
     async def warm_cache_with_history(
         self,
-        project_path: str,
+        project_id: str,
         incremental: bool = False,
         mr_limit: Optional[int] = None,
     ) -> ProcessingResult:
         """
         Warm cache AND pre-compute endpoint history.
-        
+
         This is the optimized version that:
         1. Downloads specs for each MR
         2. Extracts ALL endpoints from each spec
         3. Compares with previous versions
         4. Stores history events in cache
-        
+
         Documentation generation becomes O(1) cache read!
-        
+
         Args:
-            project_path: GitLab project path
+            project_id: Project name (primary) or GitLab path (fallback)
             incremental: Only fetch MRs since last run (default False for history rebuild)
             mr_limit: Maximum MRs to process (None for unlimited)
         """
         from src.openapi.schema_extractor import SchemaExtractor
         from src.cache.endpoint_history_cache import EndpointHistoryCache, HistoryBuilder
         from config import settings
-        
-        config = self.projects.get(project_path)
+
+        config = self._get_config(project_id)
         if not config:
             return ProcessingResult(
                 project_name="Unknown",
-                project_path=project_path,
-                errors=[f"Project not found in config: {project_path}"],
+                project_path=project_id,
+                errors=[f"Project not found in config: {project_id}"],
             )
-        
+
+        cache_id = config.name  # unique key for cache namespacing
         start_time = datetime.now()
         result = ProcessingResult(
             project_name=config.name,
-            project_path=project_path,
+            project_path=config.path,
         )
-        
+
         # Get last processed date for incremental
         since_date = None
         if incremental:
-            since_date = self._get_last_mr_date(project_path)
+            since_date = self._get_last_mr_date(cache_id)
             if since_date:
                 logger.info(f"[{config.name}] Incremental mode: since {since_date}")
         else:
@@ -606,7 +615,7 @@ class BatchProcessor:
             
             # Clear existing history for full rebuild
             if not incremental:
-                cleared = history_cache.clear_project(project_path)
+                cleared = history_cache.clear_project(cache_id)
                 logger.info(f"[{config.name}] Cleared {cleared} history entries")
             
 
@@ -614,13 +623,13 @@ class BatchProcessor:
             async with AsyncGitLabClient(client_config) as client:
                 # Fetch MRs
                 mrs = await client.get_merged_mrs(
-                    project_path,
+                    config.path,
                     limit=mr_limit,
                     since_date=since_date,
                     target_branch=config.target_branch,
                 )
                 result.mrs_found = len(mrs)
-                
+
                 if not mrs:
                     logger.info(f"[{config.name}] No MRs to process")
                     return result
@@ -712,7 +721,7 @@ class BatchProcessor:
                     try:
                         # 1. Check if MR touched swagger files
                         try:
-                            changed = await client.get_mr_changed_files(project_path, mr_iid)
+                            changed = await client.get_mr_changed_files(config.path, mr_iid)
                             if not any('swagger' in f.lower() or 'openapi' in f.lower() for f in changed):
                                 continue
                         except Exception as e:
@@ -722,7 +731,7 @@ class BatchProcessor:
                         # 2. Get current master state at merge point (merge_commit_sha)
                         if not merge_commit_sha:
                             # Fallback to head_sha if merge_commit_sha not available
-                            _, merge_commit_sha = await client.get_mr_diff_shas(project_path, mr_iid)
+                            _, merge_commit_sha = await client.get_mr_diff_shas(config.path, mr_iid)
                             if not merge_commit_sha:
                                 continue
                         
@@ -746,7 +755,7 @@ class BatchProcessor:
                             endpoints_before = previous_endpoints
                         else:
                             # First MR - get its own base for comparison
-                            base_sha, _ = await client.get_mr_diff_shas(project_path, mr_iid)
+                            base_sha, _ = await client.get_mr_diff_shas(config.path, mr_iid)
                             if base_sha:
                                 spec_before = await self._get_or_download_spec(client, config, base_sha)
                                 endpoints_before = SchemaExtractor.extract_all(spec_before) if spec_before else {}
@@ -787,9 +796,9 @@ class BatchProcessor:
                                 ep_path = ep_parts[1] if len(ep_parts) > 1 else ""
 
                                 origin_mr = await self._find_origin_mr(
-                                    client, 
-                                    project_path, 
-                                    mr, 
+                                    client,
+                                    config.path,
+                                    mr,
                                     "swagger",
                                     endpoint_key=key,
                                     method=ep_method,
@@ -865,7 +874,7 @@ class BatchProcessor:
                                     diff=diff
                                 )
                                 
-                                history_cache.add_event(project_path, key, event)
+                                history_cache.add_event(cache_id, key, event)
                                 history_events_created += 1
                                 
                                 # Update state tracker for next iteration
@@ -887,8 +896,8 @@ class BatchProcessor:
                         for mr in mrs_sorted
                         if mr.get('merged_at')
                     )
-                    self._set_last_mr_date(project_path, latest_date)
-                
+                    self._set_last_mr_date(cache_id, latest_date)
+
                 logger.info(
                     f"[{config.name}] History complete: "
                     f"{len(endpoints_found)} endpoints, {history_events_created} events"
@@ -944,34 +953,34 @@ class BatchProcessor:
     
     async def build_endpoint_history_precise(
         self,
-        project_path: str,
+        project_id: str,
         endpoint_key: str,
         mr_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Build precise history for a specific endpoint.
-        
+
         This method:
         1. Fetches all MRs
         2. Filters to MRs that changed swagger files (fast API call)
         3. For each filtered MR, compares endpoint before/after
         4. Returns only MRs that actually changed this endpoint
-        
+
         Args:
-            project_path: GitLab project path
+            project_id: Project name (primary) or GitLab path (fallback)
             endpoint_key: Endpoint to track (e.g., "POST /orders/products/list")
             mr_limit: Maximum MRs to process
-            
+
         Returns:
             List of history events with precise MR attribution
         """
         from deepdiff import DeepDiff
         from src.openapi.schema_extractor import SchemaExtractor
         from src.cache.endpoint_history_cache import EXCLUDE_COSMETIC_FIELDS
-        
-        config = self.projects.get(project_path)
+
+        config = self._get_config(project_id)
         if not config:
-            logger.error(f"Project not found: {project_path}")
+            logger.error(f"Project not found: {project_id}")
             return []
         
         # Parse endpoint
@@ -990,9 +999,9 @@ class BatchProcessor:
             
             async with AsyncGitLabClient(client_config) as client:
                 # Step 1: Fetch all MRs
-                logger.info(f"[PRECISE] Fetching MRs for {project_path}")
+                logger.info(f"[PRECISE] Fetching MRs for {config.path}")
                 mrs = await client.get_merged_mrs(
-                    project_path,
+                    config.path,
                     limit=mr_limit,
                     target_branch=config.target_branch,
                 )
@@ -1010,7 +1019,7 @@ class BatchProcessor:
                     if i % 50 == 0:
                         logger.info(f"[PRECISE] Filtering {i}/{len(mrs_sorted)}...")
                     
-                    changed_files = await client.get_mr_changed_files(project_path, mr_iid)
+                    changed_files = await client.get_mr_changed_files(config.path, mr_iid)
                     
                     # Check if any swagger files were changed
                     if any(swagger_path in f or 'swagger' in f.lower() or 'openapi' in f.lower() 
@@ -1028,7 +1037,7 @@ class BatchProcessor:
                          logger.info(f"[DEBUG] Processing target MR !{mr_iid}")
                     
                     # Get base/head SHAs from individual MR details
-                    base_sha, head_sha = await client.get_mr_diff_shas(project_path, mr_iid)
+                    base_sha, head_sha = await client.get_mr_diff_shas(config.path, mr_iid)
                     
                     if mr_iid in [168, 176, 190]:
                         logger.info(f"[DEBUG] MR !{mr_iid} SHAs: base={base_sha}, head={head_sha}")
@@ -1083,7 +1092,7 @@ class BatchProcessor:
                     if event_type:
                         # Try to find original MR if this is a merge/release MR
                         origin_mr = await self._find_origin_mr(
-                            client, project_path, mr, swagger_path,
+                            client, config.path, mr, swagger_path,
                             endpoint_key=endpoint_key,
                             method=method,
                             path=path
@@ -1190,7 +1199,7 @@ class BatchProcessor:
         Adapter to allow OriginMRResolver to download specs using project path string.
         Resolves project path to config.
         """
-        config = self.projects.get(project_path)
+        config = self._get_config(project_path)
         if not config:
             logger.warning(f"Project config not found for {project_path}")
             return None
@@ -1203,12 +1212,12 @@ class BatchProcessor:
         sha: str,
     ) -> Optional[Dict[str, Any]]:
         """Get spec from cache or download it."""
-        # Check cache first
-        cached = self.cache.get_spec(config.path, sha)
+        # Check cache first (use config.name as unique cache key)
+        cached = self.cache.get_spec(config.name, sha)
         if cached is not None:
             return cached if cached else None
-        
-        # Download
+
+        # Download (use config.path for GitLab API)
         try:
             files = await client.download_swagger_folder(
                 config.path, sha, config.swagger
@@ -1217,7 +1226,7 @@ class BatchProcessor:
                 files, config.swagger.entry_files
             )
             if spec:
-                self.cache.set_spec(config.path, sha, spec)
+                self.cache.set_spec(config.name, sha, spec)
             return spec
         except FolderNotFoundError:
             return None

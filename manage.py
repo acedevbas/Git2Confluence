@@ -30,13 +30,13 @@ async def warm_cache(args):
         # Check project filter
         if args.project:
             logger.info(f"Targeting single project: {args.project}")
-            if args.project not in processor.projects:
+            config = processor._get_config(args.project)
+            if not config:
                 logger.error(f"Project '{args.project}' not found in projects.yaml")
                 logger.info(f"Available: {list(processor.projects.keys())}")
                 sys.exit(1)
-            
+
             # Create restricted processor
-            config = processor.projects[args.project]
             processor = BatchProcessor(projects=[config])
             
         logger.info(f"🚀 Starting cache warming (Incremental: {not args.full}, History: True)")

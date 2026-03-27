@@ -32,7 +32,7 @@ class DocumentationBatchProcessor:
     """
     
     def __init__(self, projects: List[ProjectConfig]):
-        self.projects = {p.path: p for p in projects}
+        self.projects = {p.name: p for p in projects}
         self.cache = DiskCacheManager()
         self.history_cache = EndpointHistoryCache(self.cache)
         self.spec_loader = SpecLoader()
@@ -53,10 +53,14 @@ class DocumentationBatchProcessor:
         """
         target_projects = []
         if project_filter:
-            if project_filter not in self.projects:
+            # Look up by name; fallback to path match
+            config = self.projects.get(project_filter)
+            if not config:
+                config = next((p for p in self.projects.values() if p.path == project_filter), None)
+            if not config:
                 logger.error(f"Project '{project_filter}' not found in configuration")
                 return
-            target_projects = [self.projects[project_filter]]
+            target_projects = [config]
         else:
             target_projects = list(self.projects.values())
             
@@ -137,7 +141,7 @@ class DocumentationBatchProcessor:
                     continue
                 
                 # Check history cache
-                history = self.history_cache.get_history(config.path, key)
+                history = self.history_cache.get_history(config.name, key)
                 if not history or not history.events:
                     logger.warning(f"[{config.name}] No history found for '{key}'. Skipping (strict mode).")
                     count_skipped += 1
@@ -178,7 +182,8 @@ class DocumentationBatchProcessor:
                         method=method,
                         path=path,
                         events=events_for_publisher,
-                        project_path=config.path
+                        project_path=config.path,
+                        project_name=config.name
                     )
                     count_published += 1
                 except Exception as ex:

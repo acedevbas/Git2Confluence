@@ -29,16 +29,16 @@ async def rebuild():
     try:
         processor = BatchProcessor.from_config("projects.yaml")
         
-        # Check if project exists in config
-        if project_path not in processor.projects:
+        # Check if project exists in config (lookup by name or path)
+        if not processor._get_config(project_path):
             logger.error(f"Project {project_path} not found in projects.yaml")
             available = list(processor.projects.keys())
             logger.info(f"Available projects: {available}")
             return
-            
+
         # Force full rebuild (incremental=False)
         result = await processor.warm_cache_with_history(
-            project_path, 
+            project_path,
             incremental=False
         )
         

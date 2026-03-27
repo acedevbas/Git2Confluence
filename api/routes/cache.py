@@ -120,33 +120,32 @@ async def warm_cache(
         from config import settings
         from src.processing.batch_processor import BatchProcessor, ProjectConfig
         
+        # Resolve project name from config or request
+        from api.routes.projects import _load_config as _load_projects_config
+        project_name = request.project_name or ""
+        if not project_name:
+            for p in _load_projects_config().get("projects", []):
+                if p.get("path") == request.project_path:
+                    project_name = p.get("name", "")
+                    break
+        if not project_name:
+            project_name = request.project_path.split('/')[-1]
+
         # Create single-project configuration
         proj_config = ProjectConfig(
-            name=request.project_path.split('/')[-1],
+            name=project_name,
             path=request.project_path,
             gitlab_url=settings.gitlab_url,
             gitlab_token=request.gitlab_token,
             gitlab_ssl_verify=settings.gitlab_ssl_verify,
             target_branch=request.target_branch or "master",
         )
-        
+
         # Initialize processor
         processor = BatchProcessor(projects=[proj_config])
-        
-        # Run warming
-        # We assume compute_history is True by default for this API, or check request
-        # The API request model has compute_history field?
-        # Step 441 output shows: if request.compute_history: ...
-        
-        if not request.compute_history:
-            # Fallback to simple warming if history not requested?
-            # Or simplified call? BatchProcessor always computes history in 'warm_cache_with_history'
-            # But 'warm_cache_project' might be better if history not needed?
-            # Let's use warm_cache_with_history as it's the gold standard now.
-            logger.info("Computing history is enabled by default in precise mode.")
-            
+
         result = await processor.warm_cache_with_history(
-            project_path=request.project_path,
+            project_id=proj_config.name,
             incremental=bool(request.since_date),
             mr_limit=request.mr_limit
         )
@@ -239,16 +238,24 @@ async def clear_cache(
         cache = DiskCacheManager()
         
         if request.project_path:
+            # Resolve project name (cache is keyed by name)
+            from api.routes.projects import _load_config as _load_projects_config
+            cache_key = request.project_path
+            for p in _load_projects_config().get("projects", []):
+                if p.get("path") == request.project_path or p.get("name") == request.project_path:
+                    cache_key = p.get("name", request.project_path)
+                    break
+
             # Clear specific project
-            deleted = cache.flush_project(request.project_path)
-            
+            deleted = cache.flush_project(cache_key)
+
             # Also clear history
             history_cache = EndpointHistoryCache(cache)
-            history_deleted = history_cache.clear_project(request.project_path)
-            
+            history_deleted = history_cache.clear_project(cache_key)
+
             cache.close()
-            
-            logger.info(f"[CACHE] Cleared {deleted} specs + {history_deleted} history for {request.project_path}")
+
+            logger.info(f"[CACHE] Cleared {deleted} specs + {history_deleted} history for {cache_key}")
             
             return CacheClearResponse(
                 success=True,
