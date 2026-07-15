@@ -12,6 +12,51 @@ import yaml  # PyYAML
 logger = logging.getLogger(__name__)
 
 
+def _neutralize_invalid_refs(obj: Any) -> int:
+    """
+    Replace ``$ref`` nodes with a structurally-invalid fragment by an empty
+    stub, in place, and return how many were neutralized.
+
+    A JSON-pointer fragment must start with ``/`` (or be empty for the whole
+    document). Real specs occasionally ship a typo'd ref such as
+    ``#./components/responses/errorResponse`` — the fragment ``./components/...``
+    is not a valid pointer. prance's resolver raises on the first such ref and
+    aborts the whole document, so we drop just the broken node instead. Valid
+    forms are left untouched:
+      * ``#/definitions/Foo``            (internal pointer)
+      * ``components/responses.yaml#/x`` (file + pointer)
+      * ``./file.yaml``                  (plain relative file)
+    """
+    count = 0
+    if isinstance(obj, dict):
+        ref = obj.get("$ref")
+        if isinstance(ref, str) and "#" in ref:
+            fragment = ref.split("#", 1)[1]
+            if fragment and not fragment.startswith("/"):
+                obj.clear()  # -> {} stub, drops the broken reference
+                return count + 1
+        for value in obj.values():
+            count += _neutralize_invalid_refs(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            count += _neutralize_invalid_refs(item)
+    return count
+
+
+def _leave_recursive_ref_stub(limit, parsed_url, recursions=()):
+    """
+    Recursion-limit handler for prance ``RefResolver``.
+
+    When a ``$ref`` is self-referential (directly or transitively), fully
+    inlining it is impossible. Instead of raising ``ResolutionError`` (which
+    would abort resolution of the whole document), stop inlining at that point
+    and leave an empty node. This keeps resolution robust for recursive schemas
+    while every non-cyclic ref still resolves normally. The stub is stable
+    across commits, so it introduces no spurious diffs.
+    """
+    return None
+
+
 class SpecLoader:
     """
     Loads and resolves OpenAPI/Swagger specs from repository snapshots.
@@ -117,8 +162,8 @@ class SpecLoader:
         """
         # Build set of basenames for quick lookup
         path_list = list(file_paths)
-        
-        # Try each entry file in priority order
+
+        # Try each configured entry file in priority order
         for entry_name in entry_files:
             for file_path in path_list:
                 # Check if this path ends with the entry file name
@@ -126,15 +171,23 @@ class SpecLoader:
                 if normalized.endswith(f"/{entry_name}") or normalized == entry_name:
                     # Found it - return full path in tmpdir
                     return os.path.join(tmpdir, normalized)
-        
-        # Fallback: find any yaml/json at shallowest level
-        # Sort by path depth (fewest slashes = shallowest)
+
+        # Fallback: the configured entry file may not exist at older commits
+        # (e.g. before a combined ``api.yaml`` was split into per-audience
+        # files). Use the shallowest spec file present so the endpoint's
+        # pre-split history is still captured. Correctness of this fallback
+        # depends on the spec actually resolving — see _resolve_spec, which is
+        # tolerant of non-standard ``$ref`` styles used by such legacy files.
         sorted_paths = sorted(path_list, key=lambda p: p.count('/'))
         for file_path in sorted_paths:
             if file_path.endswith(('.yaml', '.yml', '.json')):
                 normalized = file_path.replace('\\', '/')
+                logger.info(
+                    f"Configured entry {list(entry_files)} not present; "
+                    f"falling back to shallowest spec file: {normalized}"
+                )
                 return os.path.join(tmpdir, normalized)
-        
+
         return None
 
 
@@ -234,62 +287,120 @@ class SpecLoader:
 
     def _resolve_spec(self, file_path: str) -> Optional[Dict[str, Any]]:
         """
-        Resolves $ref references in OpenAPI spec using ResolvingParser.
-        
-        ResolvingParser with strict=False allows parsing specs that may have
-        validation issues while still fully resolving all $ref references.
-        
-        ALWAYS cleans duplicate keys from all YAML files first, then runs Prance.
-        This ensures consistent $ref resolution across all commits.
+        Resolve all ``$ref`` references in an OpenAPI/Swagger spec.
+
+        Resolution is intentionally decoupled from *validation*. We only need a
+        structurally-resolved document to diff endpoints; whether the spec is a
+        strictly-valid OpenAPI document is irrelevant. Validating parsers reject
+        real-world specs over cosmetic issues (e.g. ``default: null`` on a typed
+        field, Swagger 2.0 quirks) and then silently degrade to unresolved
+        ``$ref`` stubs — which makes downstream schema diffing blind to any
+        change inside shared ``#/definitions``/``#/components``.
+
+        Strategy chain (Chain of Responsibility), tried in order:
+          1. ``ResolvingParser`` — validated fast path. Preserves the exact
+             output for specs that already resolve cleanly (no behaviour change).
+          2. ``RefResolver`` — pure structural resolution *without* validation.
+             Handles specs the validating parser rejects. Robust to unknown
+             dialects and non-compliant-but-usable documents.
+          3. permissive raw YAML — last resort, unresolved.
+
+        The first strategy that resolves every ``$ref`` (0 remaining) wins.
+        Otherwise the most-resolved result is kept and the residual is logged,
+        so a future "we don't resolve this" case is observable, not silent.
         """
-        # ALWAYS clean duplicate keys from ALL yaml files first
-        # This is critical for consistent $ref resolution - some commits have
-        # duplicate keys in component files which cause Prance to fail and
-        # fall back to unresolved YAML
+        # Clean duplicate keys across all component files first. Some commits
+        # ship duplicate keys that break ref resolution; normalising in place
+        # keeps resolution deterministic across commits.
         self._remove_duplicate_keys_from_file(file_path)
-        
-        # Now try ResolvingParser on cleaned files
-        spec = None
-        method_used = None
-        
-        try:
-            parser = ResolvingParser(file_path, strict=False)
-            spec = parser.specification
-            method_used = "ResolvingParser"
-        except Exception as e:
-            error_msg = str(e)
-            # Try with different backend
+
+        strategies = (
+            ("ResolvingParser", self._resolve_with_resolving_parser),
+            ("RefResolver", self._resolve_with_ref_resolver),
+            ("permissive-yaml", self._resolve_permissive_raw),
+        )
+
+        best_spec: Optional[Dict[str, Any]] = None
+        best_unresolved: Optional[int] = None
+        best_method: Optional[str] = None
+
+        for name, strategy in strategies:
             try:
-                parser = ResolvingParser(file_path, strict=False, backend='swagger-spec-validator')
-                spec = parser.specification
-                method_used = "ResolvingParser+swagger-spec-validator"
-            except Exception:
-                pass
-        
-        # Last resort: load without resolution
-        if spec is None:
-            specs = self._load_permissive_yaml(file_path)
-            if specs:
-                # Try to resolve refs manually with prance.util.resolver
-                try:
-                    from prance.util.resolver import RefResolver
-                    resolver = RefResolver(specs, url=file_path)
-                    spec = resolver.specs
-                    method_used = "RefResolver (partial)"
-                except Exception:
-                    spec = specs
-                    method_used = "raw YAML (NO resolution)"
-        
-        if spec is None:
-            print(f"  ❌ Failed to parse spec")
+                spec = strategy(file_path)
+            except Exception as e:  # a strategy failing is expected; try the next
+                logger.debug(f"Resolver strategy '{name}' failed: {e}")
+                spec = None
+
+            if not spec:
+                continue
+
+            unresolved = self._count_unresolved_refs(spec)
+            if unresolved == 0:
+                logger.debug(f"Spec fully resolved via {name}: {os.path.basename(file_path)}")
+                return spec
+
+            if best_unresolved is None or unresolved < best_unresolved:
+                best_spec, best_unresolved, best_method = spec, unresolved, name
+
+        if best_spec is None:
+            logger.error(f"Failed to parse/resolve spec: {file_path}")
             return None
-        
-        # Validate: check for unresolved $refs
-        unresolved = self._count_unresolved_refs(spec)
-        if unresolved > 0:
-            print(f"  ⚠️ {method_used}: {unresolved} unresolved $refs remain!")
-        
-        return spec
+
+        logger.warning(
+            f"Spec only partially resolved via {best_method}: "
+            f"{best_unresolved} unresolved $ref(s) remain in "
+            f"{os.path.basename(file_path)}"
+        )
+        return best_spec
+
+    def _resolve_with_resolving_parser(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Fast path: prance ResolvingParser (resolution + validation)."""
+        try:
+            return ResolvingParser(file_path, strict=False).specification
+        except Exception:
+            # Alternate validation backend occasionally succeeds where the
+            # default one rejects the document.
+            try:
+                return ResolvingParser(
+                    file_path, strict=False, backend='swagger-spec-validator'
+                ).specification
+            except Exception:
+                return None
+
+    def _resolve_with_ref_resolver(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """
+        Robust path: pure structural ``$ref`` inlining via prance RefResolver,
+        with no validation. Resolves internal (``#/...``) and relative file
+        references regardless of whether the document is a valid OpenAPI spec.
+
+        A permissive recursion handler leaves cyclic (self-referential) refs as
+        a stub instead of raising, so recursive schemas don't abort resolution.
+        """
+        from pathlib import Path
+        from prance.util.resolver import RefResolver
+        from prance.util import formats, fs
+
+        raw = fs.read_file(file_path)
+        spec_dict = formats.parse_spec(raw, file_path)
+        # A single structurally-invalid $ref (e.g. a fragment that doesn't start
+        # with '/', like "#./components/...") makes prance abort resolution of
+        # the ENTIRE document, leaving every ref unresolved. Neutralize such
+        # broken refs first so one typo doesn't wipe out an otherwise-resolvable
+        # spec. Valid refs ("#/...", "file.yaml#/...", plain file paths) are kept.
+        bad = _neutralize_invalid_refs(spec_dict)
+        if bad:
+            logger.warning(f"Neutralized {bad} malformed $ref(s) before resolution")
+        resolver = RefResolver(
+            spec_dict,
+            url=Path(file_path).resolve().as_uri(),
+            recursion_limit_handler=_leave_recursive_ref_stub,
+        )
+        resolver.resolve_references()
+        return resolver.specs
+
+    def _resolve_permissive_raw(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Last resort: raw YAML with no ref resolution."""
+        return self._load_permissive_yaml(file_path)
     
     def _count_unresolved_refs(self, obj: Any, path: str = "") -> int:
         """Count unresolved $ref in spec"""

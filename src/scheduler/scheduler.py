@@ -126,89 +126,111 @@ class SchedulerService:
     async def _run_daily_task(self):
         """
         Main daily task: warm cache for each project, then publish docs.
-        
+
+        Each project is processed in a **separate short-lived subprocess**
+        (``manage.py``) rather than in-process. This is the key memory control:
+        fully-resolved OpenAPI specs create large object graphs, and CPython
+        does not reliably return that memory to the OS after freeing it
+        (heap fragmentation). By isolating each project in its own process,
+        all of its memory is returned to the OS when the process exits, so the
+        long-lived API process never accumulates the batch's peak RSS.
+
         For each project:
-        1. Warm cache (incremental)
-        2. Publish all documentation
+        1. Warm cache + history (``manage.py cache:warm --project <name>``)
+        2. Publish docs        (``manage.py docs:publish --project <name>``)
         """
         import sys
         import os
-        
-        # Add project root to path if needed
+
+        # Project root holds manage.py and projects.yaml; run subprocesses there.
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-        
+        manage_py = os.path.join(project_root, "manage.py")
+
         from src.processing.batch_processor import BatchProcessor
-        from src.processing.docs_processor import DocumentationBatchProcessor
-        
+
         self._last_run = datetime.now()
         self._last_status = "running"
-        
+
         logger.info("=" * 60)
         logger.info("🚀 DAILY SCHEDULED TASK STARTED")
         logger.info(f"⏰ Time: {self._last_run.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("=" * 60)
-        
+
         try:
-            # Load all projects from config
+            # Load config only to enumerate project names; no heavy work here.
             processor = BatchProcessor.from_config("projects.yaml")
-            project_configs = list(processor.projects.values())
-            
-            total_projects = len(project_configs)
+            project_names = [c.name for c in processor.projects.values()]
+            processor.close()
+
+            total_projects = len(project_names)
             logger.info(f"📋 Found {total_projects} projects to process")
-            
-            for idx, config in enumerate(project_configs, 1):
-                project_name = config.name
+
+            for idx, project_name in enumerate(project_names, 1):
                 self._current_project = project_name
-                
+
                 logger.info("-" * 40)
                 logger.info(f"📦 [{idx}/{total_projects}] Processing: {project_name}")
                 logger.info("-" * 40)
-                
-                try:
-                    # Step 1: Warm cache for this project
-                    logger.info(f"🔥 Warming cache for {project_name}...")
-                    
-                    single_processor = BatchProcessor(projects=[config])
-                    cache_result = await single_processor.warm_cache_all(
-                        incremental=True,
-                        with_history=True
-                    )
-                    
-                    logger.info(f"✅ Cache warmed: {cache_result.total_cached} endpoints, {cache_result.total_mrs} MRs")
-                    
-                    if cache_result.total_errors > 0:
-                        logger.warning(f"⚠️ Cache warming had {cache_result.total_errors} errors")
-                    
-                    # Step 2: Publish documentation for this project
-                    logger.info(f"📝 Publishing documentation for {project_name}...")
-                    
-                    docs_processor = DocumentationBatchProcessor([config])
-                    await docs_processor.publish_all(
-                        project_filter=config.path,
-                        endpoint_filter=None,
-                        dry_run=False
-                    )
-                    
-                    logger.info(f"✅ Documentation published for {project_name}")
-                    
-                except Exception as e:
-                    logger.exception(f"❌ Error processing {project_name}: {e}")
+
+                # Step 1: Warm cache for this project (isolated process)
+                logger.info(f"🔥 Warming cache for {project_name}...")
+                warm_rc = await self._run_subprocess(
+                    [sys.executable, manage_py, "cache:warm", "--project", project_name],
+                    cwd=project_root,
+                    label=f"warm:{project_name}",
+                )
+                if warm_rc != 0:
+                    logger.error(f"❌ Cache warming exited with code {warm_rc} for {project_name}; skipping publish")
                     continue
-            
+
+                # Step 2: Publish documentation for this project (isolated process)
+                logger.info(f"📝 Publishing documentation for {project_name}...")
+                pub_rc = await self._run_subprocess(
+                    [sys.executable, manage_py, "docs:publish", "--project", project_name],
+                    cwd=project_root,
+                    label=f"publish:{project_name}",
+                )
+                if pub_rc != 0:
+                    logger.error(f"❌ Documentation publish exited with code {pub_rc} for {project_name}")
+                    continue
+
+                logger.info(f"✅ Done: {project_name}")
+
             self._last_status = "completed"
             self._current_project = None
-            
+
             logger.info("=" * 60)
             logger.info("✅ DAILY SCHEDULED TASK COMPLETED")
             logger.info(f"⏱️ Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
-            
+
         except Exception as e:
             self._last_status = f"failed: {str(e)}"
             self._current_project = None
             logger.exception(f"❌ Daily task failed: {e}")
+
+    async def _run_subprocess(self, args: List[str], cwd: str, label: str) -> int:
+        """
+        Run a child process, stream its output to the logs, and return the exit code.
+
+        Output is streamed line-by-line so a long-running project shows progress
+        rather than buffering everything until completion.
+        """
+        logger.info(f"▶️ [{label}] {' '.join(args)}")
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        assert proc.stdout is not None
+        async for raw_line in proc.stdout:
+            line = raw_line.decode("utf-8", errors="replace").rstrip()
+            if line:
+                logger.info(f"[{label}] {line}")
+
+        return await proc.wait()
 
 
 # Global instance

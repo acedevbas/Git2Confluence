@@ -24,11 +24,13 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 import re
 import hashlib
 import json
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -248,6 +250,12 @@ class BatchProcessor:
         self.spec_loader = SpecLoader()
         self.max_concurrent_projects = max_concurrent_projects
 
+        # Small in-memory LRU of deserialized specs, keyed by (cache_id, sha).
+        # Origin detection requests the same spec once per changed endpoint;
+        # without this every hit gunzips and re-parses a multi-MB dict.
+        self._spec_mem_cache: "OrderedDict[tuple[str, str], Dict[str, Any]]" = OrderedDict()
+        self._spec_mem_cache_max = 6
+
         # Initialize Origin Resolver with default config
         self.origin_resolver = OriginMRResolver.create_default(
             self._download_spec_adapter
@@ -256,6 +264,11 @@ class BatchProcessor:
     def _get_config(self, project_id: str) -> Optional[ProjectConfig]:
         """Look up project config by name (primary) or path (fallback)."""
         return self.projects.get(project_id) or self._projects_by_path.get(project_id)
+
+    def close(self) -> None:
+        """Release cache resources held by this processor."""
+        self._spec_mem_cache.clear()
+        self.cache.close()
     
     @classmethod
     def from_config(cls, config_path: str = "projects.yaml") -> BatchProcessor:
@@ -701,20 +714,41 @@ class BatchProcessor:
                 endpoints_found = set()
                 history_events_created = 0
                 seen_changes = set() # (task_id, diff_hash) deduplication
-                
+
                 # Track last event type per endpoint for REVERT detection
                 endpoint_last_event = {}  # key -> last_event_type
-                
+
                 # MERGE COMMIT TIMELINE: Track previous merge commit for correct sequential comparison
                 # This compares actual master states, not individual branch diffs
                 previous_merge_sha: Optional[str] = None
                 previous_endpoints: Dict[str, Dict] = {}
-                
+
+                # Buffer events and write each endpoint's history in bulk:
+                # per-event add_event() re-reads and re-writes the whole
+                # history blob, which is quadratic in memory/IO on large runs
+                pending_history: Dict[str, List[HistoryEvent]] = {}
+                FLUSH_EVERY_MRS = 25
+
+                def flush_history() -> None:
+                    if not pending_history:
+                        return
+                    for ep_key, ep_events in pending_history.items():
+                        history_cache.add_events(cache_id, ep_key, ep_events)
+                    pending_history.clear()
+                    # Resolved specs and extracted schemas create large object
+                    # graphs; reclaim them promptly to keep the RSS high-water
+                    # mark down instead of waiting for gen-2 GC thresholds.
+                    gc.collect()
+
                 # Process each MR using precise diff logic
-                for i, mr in enumerate(mrs_sorted, 1):
+                try:
+                  for i, mr in enumerate(mrs_sorted, 1):
                     mr_iid = mr.get('iid')
                     merge_commit_sha = mr.get('merge_commit_sha')
-                    
+
+                    if i % FLUSH_EVERY_MRS == 0:
+                        flush_history()
+
                     if i % 10 == 0:
                         logger.info(f"[{config.name}] Scanning MR {i}/{len(mrs_sorted)} (!{mr_iid})...")
                     
@@ -745,7 +779,12 @@ class BatchProcessor:
                         
                         # 4. Extract endpoints from current state
                         endpoints_current = SchemaExtractor.extract_all(spec_current) if spec_current else {}
-                        
+
+                        # The fully-resolved spec dict is no longer needed in this
+                        # scope (origin detection re-fetches its own specs); drop
+                        # the local reference so only the bounded LRU retains it.
+                        spec_current = None
+
                         if endpoints_current:
                             endpoints_found.update(endpoints_current.keys())
                         
@@ -874,12 +913,12 @@ class BatchProcessor:
                                     diff=diff
                                 )
                                 
-                                history_cache.add_event(cache_id, key, event)
+                                pending_history.setdefault(key, []).append(event)
                                 history_events_created += 1
-                                
+
                                 # Update state tracker for next iteration
                                 endpoint_last_event[key] = event_type
-                        
+
                         # Update timeline: current state becomes "before" for next MR
                         previous_merge_sha = merge_commit_sha
                         previous_endpoints = endpoints_current
@@ -888,7 +927,9 @@ class BatchProcessor:
                         result.specs_failed += 1
                         result.errors.append(f"MR !{mr_iid}: {e}")
                         logger.warning(f"[{config.name}] Failed processing MR !{mr_iid}: {e}")
-                
+                finally:
+                    flush_history()
+
                 # Update last MR date
                 if mrs_sorted:
                     latest_date = max(
@@ -1205,6 +1246,13 @@ class BatchProcessor:
             return None
         return await self._get_or_download_spec(client, config, sha)
 
+    def _remember_spec(self, mem_key: tuple[str, str], spec: Dict[str, Any]) -> None:
+        """Put a deserialized spec into the bounded in-memory LRU."""
+        self._spec_mem_cache[mem_key] = spec
+        self._spec_mem_cache.move_to_end(mem_key)
+        while len(self._spec_mem_cache) > self._spec_mem_cache_max:
+            self._spec_mem_cache.popitem(last=False)
+
     async def _get_or_download_spec(
         self,
         client: AsyncGitLabClient,
@@ -1212,10 +1260,19 @@ class BatchProcessor:
         sha: str,
     ) -> Optional[Dict[str, Any]]:
         """Get spec from cache or download it."""
-        # Check cache first (use config.name as unique cache key)
+        # Check in-memory LRU first (avoids gzip+parse of the disk value)
+        mem_key = (config.name, sha)
+        if mem_key in self._spec_mem_cache:
+            self._spec_mem_cache.move_to_end(mem_key)
+            return self._spec_mem_cache[mem_key]
+
+        # Check disk cache (use config.name as unique cache key)
         cached = self.cache.get_spec(config.name, sha)
         if cached is not None:
-            return cached if cached else None
+            if cached:
+                self._remember_spec(mem_key, cached)
+                return cached
+            return None
 
         # Download (use config.path for GitLab API)
         try:
@@ -1226,7 +1283,29 @@ class BatchProcessor:
                 files, config.swagger.entry_files
             )
             if spec:
+                # Quality gate: only trust FULLY-resolved specs for history.
+                # A spec left with unresolved $refs yields degraded/empty
+                # endpoint schemas; diffing those against real ones fabricates
+                # bogus "everything removed / everything added" events across
+                # adjacent commits. Treat a partially-resolved commit as
+                # unavailable so the diff timeline compares only trustworthy
+                # (fully-resolved) states.
+                unresolved = self.spec_loader._count_unresolved_refs(spec)
+                if unresolved > 0:
+                    logger.warning(
+                        f"[{config.name}] Spec at {sha[:8]} still has "
+                        f"{unresolved} unresolved $ref(s) after all resolution "
+                        f"strategies — skipping this commit for history to "
+                        f"avoid fabricated diffs."
+                    )
+                    # Cache the NULL marker so we don't re-download a commit we
+                    # already know we cannot use.
+                    self.cache.set_spec(config.name, sha, None)
+                    self._spec_mem_cache[mem_key] = None
+                    return None
+
                 self.cache.set_spec(config.name, sha, spec)
+                self._remember_spec(mem_key, spec)
             return spec
         except FolderNotFoundError:
             return None

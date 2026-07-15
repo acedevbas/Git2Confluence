@@ -4,6 +4,7 @@ FastAPI application for OpenAPI History Tracker.
 Provides REST API endpoints for generating API documentation
 from GitLab MR history and publishing to Confluence.
 """
+import os
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -17,6 +18,12 @@ from src.logging_config import setup_logging, get_logger
 # Configure centralized logging with ring buffer
 setup_logging(level="INFO", debug_mode=False)
 logger = get_logger(__name__)
+
+# Application version — baked into the image at build time via the APP_VERSION
+# build-arg (see Dockerfile). Falls back to "dev" for local runs. This is what
+# /docs, /, /health and /version report, so the running image tag is always
+# visible without exec-ing into the container.
+APP_VERSION = os.getenv("APP_VERSION", "dev")
 
 
 @asynccontextmanager
@@ -79,7 +86,7 @@ curl -X POST "http://localhost:8000/api/v1/documentation/generate" \\
   }'
 ```
     """,
-    version="1.0.0",
+    version=APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -118,10 +125,22 @@ async def root():
     """
     return {
         "service": "OpenAPI History Tracker",
-        "version": "1.0.0",
+        "version": APP_VERSION,
         "docs": "/docs",
         "health": "/health"
     }
+
+
+@app.get("/version", tags=["🏠 Система"], summary="Версия образа")
+async def get_version():
+    """
+    Текущая версия развёрнутого образа.
+
+    Значение вшивается в образ при сборке (build-arg `APP_VERSION`), поэтому
+    отражает реально запущенный тег — удобно для проверки деплоя:
+    `curl https://<host>/version`.
+    """
+    return {"version": APP_VERSION}
 
 
 @app.get("/health", response_model=HealthResponse, tags=["🏠 Система"], summary="Проверка здоровья")
@@ -163,7 +182,7 @@ async def health_check():
     
     return HealthResponse(
         status="healthy" if cache_ok and gitlab_ok else "degraded",
-        version="1.0.0",
+        version=APP_VERSION,
         redis_connected=cache_ok,
         gitlab_connected=gitlab_ok
     )

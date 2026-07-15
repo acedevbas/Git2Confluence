@@ -335,7 +335,46 @@ class EndpointHistoryCache:
             history.events.append(event)
             history.last_mr_date = event.merged_at[:10]
             history.last_updated = datetime.now().isoformat()
-        
+
+        self.set_history(project_path, endpoint_key, history)
+
+    def add_events(
+        self,
+        project_path: str,
+        endpoint_key: str,
+        events: Sequence[HistoryEvent],
+    ) -> None:
+        """
+        Add multiple events to endpoint history in one read-modify-write.
+
+        Produces the same stored history as calling add_event() for each
+        event in order, but loads and saves the (potentially large) history
+        blob once instead of once per event.
+        """
+        if not events:
+            return
+
+        history = self.get_history(project_path, endpoint_key)
+
+        if history is None:
+            parts = endpoint_key.split(" ", 1)
+            method = parts[0] if len(parts) > 1 else ""
+            path = parts[1] if len(parts) > 1 else endpoint_key
+            history = EndpointHistory(
+                endpoint_key=endpoint_key,
+                method=method,
+                path=path,
+            )
+
+        existing_shas = {e.commit_sha for e in history.events}
+        for event in events:
+            if event.commit_sha in existing_shas:
+                continue
+            existing_shas.add(event.commit_sha)
+            history.events.append(event)
+            history.last_mr_date = event.merged_at[:10]
+            history.last_updated = datetime.now().isoformat()
+
         self.set_history(project_path, endpoint_key, history)
     
     def clear_endpoint(self, project_path: str, endpoint_key: str) -> None:

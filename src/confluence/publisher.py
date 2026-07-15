@@ -784,7 +784,8 @@ class ConfluencePublisher:
         request_example = json.dumps(
             generate_example_from_schema(request_body),
             indent=2,
-            ensure_ascii=False
+            ensure_ascii=False,
+            default=str,  # tolerate non-JSON values (e.g. datetime examples)
         )
         
         # Extract success response fields (200)
@@ -811,12 +812,15 @@ class ConfluencePublisher:
         success_example = json.dumps(
             generate_example_from_schema(success_schema),
             indent=2,
-            ensure_ascii=False
+            ensure_ascii=False,
+            default=str,  # tolerate non-JSON values (e.g. datetime examples)
         )
         
         # Extract error responses
         error_examples = []
         for code, response in responses.items():
+            # Response codes may be ints (unquoted YAML: `200:`); coerce to str
+            code = str(code)
             if code.startswith('4') or code.startswith('5'):
                 error_schema = response.get('schema', {})
                 error_fields = flatten_schema_to_fields(error_schema)
@@ -838,7 +842,8 @@ class ConfluencePublisher:
                 error_example = json.dumps(
                     generate_example_from_schema(error_schema),
                     indent=2,
-                    ensure_ascii=False
+                    ensure_ascii=False,
+                    default=str,  # tolerate non-JSON values (e.g. datetime examples)
                 )
                 error_desc = response.get('description', f'HTTP {code} Error')
                 error_examples.append((error_example, code, error_desc, error_fields))
@@ -1352,7 +1357,34 @@ class ConfluencePublisher:
         # but actual fields remain the same
         if current_schema and changes:
             changes = self._filter_false_positive_changes(changes, current_schema, previous_schema)
-        
+
+        # Per-field required changes (обязательный ⇄ необязательный).
+        # DeepDiff encodes these inconsistently — when a field is the only
+        # required one, dropping it removes the whole ['required'] key, which the
+        # loops above can only attribute to the PARENT object, so the changed
+        # field itself never gets highlighted. Compare flattened field
+        # definitions directly and mark the specific field 'modified' with its
+        # section-relative full_path — exactly the key the table matcher looks up.
+        if current_schema and previous_schema:
+            def _mark_required(cur_sec, prev_sec):
+                if not cur_sec or not prev_sec:
+                    return
+                cur = {f['full_path']: f.get('required', False)
+                       for f in flatten_schema_to_fields(cur_sec) if f.get('full_path')}
+                prev = {f['full_path']: f.get('required', False)
+                        for f in flatten_schema_to_fields(prev_sec) if f.get('full_path')}
+                for fp in cur.keys() & prev.keys():
+                    if cur[fp] != prev[fp] and changes.get(fp) not in ('added', 'removed'):
+                        changes[fp] = 'modified'
+
+            _mark_required(current_schema.get('requestBody', {}),
+                           previous_schema.get('requestBody', {}))
+            cur_resps = current_schema.get('responses', {}) or {}
+            prev_resps = previous_schema.get('responses', {}) or {}
+            for code in set(cur_resps) & set(prev_resps):
+                _mark_required(cur_resps.get(code, {}).get('schema', {}),
+                               prev_resps.get(code, {}).get('schema', {}))
+
         return changes
     
     def _extract_structural_field_changes(
@@ -1757,9 +1789,13 @@ class ConfluencePublisher:
                 if field_path not in changes:
                     changes[field_path] = 'modified'
     
-    def _normalize_path(self, deepdiff_path: str) -> str:
+    @staticmethod
+    def _normalize_path(deepdiff_path: str) -> str:
         """
         Normalize DeepDiff path to field path for table matching.
+
+        Pure string helper (no instance state) — safe to call without
+        constructing a publisher / Confluence credentials.
         
         Uses DeepDiff's parse_path for reliable path parsing.
         

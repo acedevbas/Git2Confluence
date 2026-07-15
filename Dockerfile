@@ -1,10 +1,15 @@
 # Base image
 FROM python:3.12-slim
 
+# Build-time version, surfaced by the app at /docs, /, /health and /version.
+# Pass with: docker build --build-arg APP_VERSION=1.03 ...
+ARG APP_VERSION=dev
+
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    APP_VERSION=${APP_VERSION}
 
 # Set working directory
 WORKDIR /app

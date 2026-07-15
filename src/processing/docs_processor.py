@@ -31,9 +31,9 @@ class DocumentationBatchProcessor:
        - If yes, publish to Confluence using ConfluencePublisher
     """
     
-    def __init__(self, projects: List[ProjectConfig]):
+    def __init__(self, projects: List[ProjectConfig], cache: Optional[DiskCacheManager] = None):
         self.projects = {p.name: p for p in projects}
-        self.cache = DiskCacheManager()
+        self.cache = cache or DiskCacheManager()
         self.history_cache = EndpointHistoryCache(self.cache)
         self.spec_loader = SpecLoader()
     

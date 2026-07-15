@@ -336,12 +336,14 @@ def _generate_detailed_change_description(
         if path.endswith("['format']"):
             continue
     
-    # Process changed values - analyze old_value/new_value for details
+    # Process changed values - analyze old_value/new_value for details.
+    # _normalize_path is a pure static helper — call it directly instead of
+    # constructing a ConfluencePublisher (which would require Confluence
+    # credentials that aren't available in this rendering context).
     from .publisher import ConfluencePublisher
-    publisher = ConfluencePublisher() # Helper for normalization
 
     for path, change_info in diff.get('values_changed', {}).items():
-        normalized = publisher._normalize_path(path)
+        normalized = ConfluencePublisher._normalize_path(path)
         if not normalized:
             continue
             
@@ -373,7 +375,7 @@ def _generate_detailed_change_description(
         if path.endswith("['required']"):
             import re
             parent_path = re.sub(r"\['required'\]$", "", path)
-            normalized_parent = publisher._normalize_path(parent_path)
+            normalized_parent = ConfluencePublisher._normalize_path(parent_path)
             
             if normalized_parent:
                 section = _get_section_from_field_path(normalized_parent)
@@ -390,19 +392,21 @@ def _generate_detailed_change_description(
         if path.endswith("['required']"):
             import re
             parent_path = re.sub(r"\['required'\]$", "", path)
-            normalized_parent = publisher._normalize_path(parent_path)
+            normalized_parent = ConfluencePublisher._normalize_path(parent_path)
             
             if normalized_parent:
                 section = _get_section_from_field_path(normalized_parent)
                 if isinstance(value, str) and not value.isdigit():
-                    sections.get(section, sections['requestBody'])['modified'].append(f"{value} (стало опциональным)")
+                    sections.get(section, sections['requestBody'])['modified'].append(f"{value} (стало необязательным)")
     
-    # Handle structural changes via schema comparison
-    # NOTE: These functions were never implemented, causing NameError
-    # TODO: Implement if needed
-    # if current_schema and previous_schema:
-    #     _extract_structural_changes(diff, sections, current_schema, previous_schema)
-    #     _extract_required_changes(sections, current_schema, previous_schema)
+    # Required-attribute changes (обязательный ⇄ необязательный) are detected by
+    # comparing flattened field definitions directly. This is robust regardless
+    # of how DeepDiff encodes the change: when a field is the only required one,
+    # dropping it removes the whole `['required']` key (a dictionary_item_removed
+    # that the diff-parsing above intentionally skips), so relying on the diff
+    # alone misses it. Schema comparison catches every case.
+    if current_schema and previous_schema:
+        _extract_required_changes(sections, current_schema, previous_schema)
     
     # Enrich added fields with child field info for nested objects
     if current_schema:
@@ -1051,19 +1055,21 @@ def _extract_required_changes(
         previous_fields = {f.get('full_path', ''): f for f in flatten_schema_to_fields(previous_rb) if f.get('full_path')}
         
         common_paths = current_fields.keys() & previous_fields.keys()
-        existing_modified = [m.split(' (')[0] for m in sections['requestBody']['modified']]
-        
+        sec_mod = sections['requestBody']['modified']
+
         for path in common_paths:
             current_required = current_fields[path].get('required', False)
             previous_required = previous_fields[path].get('required', False)
-            
+
             if current_required != previous_required:
                 field_name = path.split('.')[-1] if '.' in path else path
-                if field_name not in existing_modified:
-                    if current_required:
-                        sections['requestBody']['modified'].append(f"{field_name} (стало обязательным)")
-                    else:
-                        sections['requestBody']['modified'].append(f"{field_name} (стало опциональным)")
+                annotated = (f"{field_name} (стало обязательным)" if current_required
+                             else f"{field_name} (стало необязательным)")
+                # Replace any generic (un-annotated) entry for this field with the
+                # specific "стало (не)обязательным" wording (dedupe-safe).
+                sec_mod[:] = [m for m in sec_mod if m != field_name]
+                if annotated not in sec_mod:
+                    sec_mod.append(annotated)
     
     # Compare responses (200/201) - THIS WAS MISSING!
     current_responses = current_schema.get('responses', {})
@@ -1079,19 +1085,19 @@ def _extract_required_changes(
             
             section_key = 'responses.200'
             common_paths = current_fields.keys() & previous_fields.keys()
-            existing_modified = [m.split(' (')[0] for m in sections[section_key]['modified']]
-            
+            sec_mod = sections[section_key]['modified']
+
             for path in common_paths:
                 current_required = current_fields[path].get('required', False)
                 previous_required = previous_fields[path].get('required', False)
-                
+
                 if current_required != previous_required:
                     field_name = path.split('.')[-1] if '.' in path else path
-                    if field_name not in existing_modified:
-                        if current_required:
-                            sections[section_key]['modified'].append(f"{field_name} (стало обязательным)")
-                        else:
-                            sections[section_key]['modified'].append(f"{field_name} (стало опциональным)")
+                    annotated = (f"{field_name} (стало обязательным)" if current_required
+                                 else f"{field_name} (стало необязательным)")
+                    sec_mod[:] = [m for m in sec_mod if m != field_name]
+                    if annotated not in sec_mod:
+                        sec_mod.append(annotated)
 
 
 def _dedupe_fields(fields: List[str], max_count: int = 5) -> List[str]:

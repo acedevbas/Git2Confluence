@@ -1,4 +1,30 @@
+import datetime as _dt
 from typing import Dict, Any, List
+
+
+def _json_safe(obj: Any) -> Any:
+    """
+    Normalize an extracted schema into a canonical, JSON-serializable form.
+
+    Real-world OpenAPI/Swagger specs (parsed from YAML) contain values that
+    break downstream JSON serialization and string-key assumptions:
+      * date/date-time ``example`` values parse into Python datetime objects
+        (not JSON-serializable) -> converted to ISO strings.
+      * unquoted response codes (``200:``) parse as ints -> callers do
+        ``code.startswith('4')`` and ``responses.get('200')`` which assume
+        strings; keys are coerced to str.
+
+    Normalizing here, at the extraction boundary, keeps every consumer
+    (diffing, hashing, Confluence rendering) simple and correct.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (_dt.datetime, _dt.date, _dt.time)):
+        return obj.isoformat()
+    return obj
+
 
 class SchemaExtractor:
     @staticmethod
@@ -95,8 +121,10 @@ class SchemaExtractor:
                     resp_snapshot['schema'] = SchemaExtractor._simplify_schema(schema)
             
             snapshot['responses'][code] = resp_snapshot
-            
-        return snapshot
+
+        # Canonicalize: string response-code keys + JSON-safe values
+        # (datetime examples -> ISO strings). See _json_safe docstring.
+        return _json_safe(snapshot)
     
     @staticmethod
     def extract_all(spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -154,8 +182,12 @@ class SchemaExtractor:
             simple['items'] = SchemaExtractor._simplify_schema(simple['items'])
             
         if 'properties' in simple:
-            for prop_name, prop_schema in simple['properties'].items():
-                simple['properties'][prop_name] = SchemaExtractor._simplify_schema(prop_schema)
+            # Build a new dict: 'properties' is shared with the source schema
+            # after the shallow copy above, and must not be mutated in place
+            simple['properties'] = {
+                prop_name: SchemaExtractor._simplify_schema(prop_schema)
+                for prop_name, prop_schema in simple['properties'].items()
+            }
                 
         if 'additionalProperties' in simple and isinstance(simple['additionalProperties'], dict):
              simple['additionalProperties'] = SchemaExtractor._simplify_schema(simple['additionalProperties'])

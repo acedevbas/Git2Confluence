@@ -14,3 +14,9 @@ cache_data/
 temp_api/
 .idea/
 .vscode/
+
+# Secrets & runtime config — provided via volume mounts at runtime
+# (see docker-compose.prod.yml), must NOT be baked into the image.
+.env
+.env.*
+projects.yaml
