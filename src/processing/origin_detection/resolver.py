@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
+from src.openapi.file_detection import touches_openapi_source
+
 from .types import CandidateMR, OriginDetectionConfig
 from .candidate_collector import CandidateCollector, get_default_collectors
 from .endpoint_detector import EndpointChangeDetector
@@ -216,19 +218,16 @@ class OriginMRResolver:
                 changed = await client.get_mr_changed_files(
                     project_path, candidate.iid
                 )
-                for filepath in changed:
-                    if swagger_path in filepath:
-                        logger.info(
-                            f"[Resolver] Fallback: using !{candidate.iid} "
-                            f"(touched swagger)"
-                        )
-                        return candidate
-                    if self._config.matches_swagger_file(filepath):
-                        logger.info(
-                            f"[Resolver] Fallback: using !{candidate.iid} "
-                            f"(touched swagger)"
-                        )
-                        return candidate
+                if touches_openapi_source(
+                    changed,
+                    swagger_path,
+                    self._config.swagger_patterns,
+                ):
+                    logger.info(
+                        f"[Resolver] Fallback: using !{candidate.iid} "
+                        f"(touched swagger)"
+                    )
+                    return candidate
             except Exception:
                 continue
         return None

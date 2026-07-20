@@ -46,6 +46,7 @@ from src.gitlab.client import (
 )
 from src.openapi.spec_loader import SpecLoader
 from src.openapi.spec_loader import SpecLoader
+from src.openapi.file_detection import touches_openapi_source
 from src.cache.disk_cache import DiskCacheManager
 from deepdiff import DeepDiff
 from src.cache.endpoint_history_cache import HistoryEvent
@@ -753,10 +754,14 @@ class BatchProcessor:
                         logger.info(f"[{config.name}] Scanning MR {i}/{len(mrs_sorted)} (!{mr_iid})...")
                     
                     try:
-                        # 1. Check if MR touched swagger files
+                        # 1. Check if MR touched any file in the OpenAPI source.
+                        # Split specs commonly use neutral paths such as
+                        # docs/exchanges/*.yaml and docs/common/*.yaml.
                         try:
                             changed = await client.get_mr_changed_files(config.path, mr_iid)
-                            if not any('swagger' in f.lower() or 'openapi' in f.lower() for f in changed):
+                            if not touches_openapi_source(
+                                changed, config.swagger.path
+                            ):
                                 continue
                         except Exception as e:
                             logger.warning(f"Failed to check changes for MR !{mr_iid}: {e}")
@@ -838,7 +843,7 @@ class BatchProcessor:
                                     client,
                                     config.path,
                                     mr,
-                                    "swagger",
+                                    config.swagger.path,
                                     endpoint_key=key,
                                     method=ep_method,
                                     path=ep_path
@@ -1062,9 +1067,9 @@ class BatchProcessor:
                     
                     changed_files = await client.get_mr_changed_files(config.path, mr_iid)
                     
-                    # Check if any swagger files were changed
-                    if any(swagger_path in f or 'swagger' in f.lower() or 'openapi' in f.lower() 
-                           for f in changed_files):
+                    # Include any file in the configured source tree so changes
+                    # to split operations/components are not skipped.
+                    if touches_openapi_source(changed_files, swagger_path):
                         relevant_mrs.append(mr)
                 
                 logger.info(f"[PRECISE] {len(relevant_mrs)} MRs touched swagger files")

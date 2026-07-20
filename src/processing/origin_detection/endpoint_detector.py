@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from deepdiff import DeepDiff
 
+from src.openapi.file_detection import touches_openapi_source
 from src.openapi.schema_extractor import SchemaExtractor
 from .types import CandidateMR, EndpointChange, OriginDetectionConfig, ChangeType, EXCLUDE_COSMETIC_REGEX_PATHS
 
@@ -149,12 +150,11 @@ class EndpointChangeDetector:
         swagger_path: str
     ) -> bool:
         """Check if any changed file is a swagger/openapi file."""
-        for filepath in changed_files:
-            if swagger_path in filepath:
-                return True
-            if self._config.matches_swagger_file(filepath):
-                return True
-        return False
+        return touches_openapi_source(
+            changed_files,
+            swagger_path,
+            self._config.swagger_patterns,
+        )
     
     def _extract_endpoint(
         self, 

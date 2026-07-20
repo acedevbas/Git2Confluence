@@ -77,6 +77,16 @@ class TestCommitMessageCollector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidates[0].source_branch, 'feature/LOG-123')
 
 class TestEndpointChangeDetector(unittest.IsolatedAsyncioTestCase):
+    def test_split_component_file_touches_configured_source(self):
+        detector = EndpointChangeDetector(AsyncMock(), OriginDetectionConfig())
+
+        self.assertTrue(
+            detector._touches_swagger(
+                ['docs/common/responses.yaml'],
+                'docs',
+            )
+        )
+
     async def test_detect_change_modified(self):
         # Setup
         client = MagicMock()
